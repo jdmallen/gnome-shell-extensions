@@ -184,6 +184,223 @@ class SwapSection extends LoadStatSection {
     }
 }
 
+const TEMPERATURE_HIGH_CELSIUS = 85;
+const HWMON_ROOT = '/sys/class/hwmon';
+
+// CPU sensors in order of preference: [hwmon driver name, temp label or null]
+const CPU_SENSOR_PREFERENCES = [
+    ['k10temp', 'Tctl'],          // AMD Ryzen
+    ['coretemp', 'Package id 0'], // Intel
+    ['zenpower', 'Tdie'],
+    ['thinkpad', 'CPU'],
+    ['acpitz', null],
+];
+
+/**
+ * @param {string} path
+ * @returns {string|null}
+ */
+function readSysfsText(path) {
+    try {
+        const [, contents] = GLib.file_get_contents(path);
+        return new TextDecoder().decode(contents).trim();
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Find the sysfs tempN_input path of the preferred CPU sensor.
+ * hwmon numbering changes across boots, so match by driver name.
+ *
+ * @returns {string|null}
+ */
+function findCpuTemperatureInput() {
+    let hwmonNames;
+    try {
+        hwmonNames = GLib.Dir.open(HWMON_ROOT, 0);
+    } catch {
+        return null;
+    }
+
+    const devicesByDriver = new Map();
+    let entryName;
+    while ((entryName = hwmonNames.read_name()) !== null) {
+        const devicePath = `${HWMON_ROOT}/${entryName}`;
+        const driverName = readSysfsText(`${devicePath}/name`);
+        if (driverName && !devicesByDriver.has(driverName))
+            devicesByDriver.set(driverName, devicePath);
+    }
+    hwmonNames.close();
+
+    for (const [driverName, wantedLabel] of CPU_SENSOR_PREFERENCES) {
+        const devicePath = devicesByDriver.get(driverName);
+        if (!devicePath)
+            continue;
+
+        for (let sensorIndex = 1; sensorIndex <= 16; sensorIndex++) {
+            const inputPath = `${devicePath}/temp${sensorIndex}_input`;
+            if (readSysfsText(inputPath) === null)
+                continue;
+
+            const label = readSysfsText(`${devicePath}/temp${sensorIndex}_label`);
+            if (wantedLabel === null || label === wantedLabel)
+                return inputPath;
+        }
+    }
+    return null;
+}
+
+class TemperatureSection extends StatSection {
+    static {
+        GObject.registerClass(this);
+    }
+
+    #formatter = new Intl.NumberFormat(undefined, {
+        style: 'unit',
+        unit: 'celsius',
+        maximumFractionDigits: 0,
+    });
+
+    #inputPath = null;
+
+    constructor(iconDir) {
+        super(iconDir, 'temperature-symbolic', _('CPU temperature'));
+    }
+
+    _readCelsius() {
+        this.#inputPath ??= findCpuTemperatureInput();
+        if (!this.#inputPath)
+            return null;
+
+        const millidegrees = Number.parseInt(readSysfsText(this.#inputPath), 10);
+        if (Number.isNaN(millidegrees)) {
+            this.#inputPath = null; // sensor vanished; rediscover next tick
+            return null;
+        }
+        return millidegrees / 1000;
+    }
+
+    _update() {
+        const celsius = this._readCelsius();
+        this.label.text = celsius === null ? '--' : this.#formatter.format(celsius);
+
+        if (celsius !== null && celsius >= TEMPERATURE_HIGH_CELSIUS)
+            this.add_style_class_name('high-usage');
+        else
+            this.remove_style_class_name('high-usage');
+    }
+}
+
+Gio._promisify(Gio.File.prototype, 'load_contents_async');
+
+const POWER_SUPPLY_ROOT = '/sys/class/power_supply';
+
+/**
+ * Sysfs directories of system batteries (excludes peripheral batteries
+ * such as mice, which report scope "Device").
+ *
+ * @returns {string[]}
+ */
+function findSystemBatteries() {
+    let supplyNames;
+    try {
+        supplyNames = GLib.Dir.open(POWER_SUPPLY_ROOT, 0);
+    } catch {
+        return [];
+    }
+
+    const batteryPaths = [];
+    let entryName;
+    while ((entryName = supplyNames.read_name()) !== null) {
+        const supplyPath = `${POWER_SUPPLY_ROOT}/${entryName}`;
+        if (readSysfsText(`${supplyPath}/type`) !== 'Battery')
+            continue;
+        if (readSysfsText(`${supplyPath}/scope`) === 'Device')
+            continue;
+        batteryPaths.push(supplyPath);
+    }
+    supplyNames.close();
+    return batteryPaths;
+}
+
+/**
+ * @param {string} path
+ * @returns {Promise<number|null>}
+ */
+async function readSysfsNumberAsync(path) {
+    try {
+        const [contents] = await Gio.File.new_for_path(path).load_contents_async(null);
+        const value = Number.parseInt(new TextDecoder().decode(contents).trim(), 10);
+        return Number.isNaN(value) ? null : value;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * @param {string} batteryPath
+ * @returns {Promise<number|null>} watts; some firmware reports negative
+ *   values while discharging, so the magnitude is used
+ */
+async function readBatteryWatts(batteryPath) {
+    const microwatts = await readSysfsNumberAsync(`${batteryPath}/power_now`);
+    if (microwatts !== null)
+        return Math.abs(microwatts) / 1e6;
+
+    const microamps = await readSysfsNumberAsync(`${batteryPath}/current_now`);
+    const microvolts = await readSysfsNumberAsync(`${batteryPath}/voltage_now`);
+    if (microamps === null || microvolts === null)
+        return null;
+    return Math.abs(microamps * microvolts) / 1e12;
+}
+
+class PowerSection extends StatSection {
+    static {
+        GObject.registerClass(this);
+    }
+
+    // ECMA-402 has no "watt" unit, so the unit is appended by hand
+    #formatter = new Intl.NumberFormat(undefined, {
+        minimumFractionDigits: 1,
+        maximumFractionDigits: 1,
+    });
+
+    #batteryPaths = [];
+    #updateInFlight = false;
+
+    constructor(iconDir) {
+        super(iconDir, 'power-symbolic', _('Power draw'));
+    }
+
+    _update() {
+        if (this.#updateInFlight)
+            return;
+        this.#updateInFlight = true;
+        this._updateAsync()
+            .catch(error => logError(error, 'system-monitor-thermal power'))
+            .finally(() => (this.#updateInFlight = false));
+    }
+
+    async _updateAsync() {
+        if (this.#batteryPaths.length === 0)
+            this.#batteryPaths = findSystemBatteries();
+
+        const readings = await Promise.all(
+            this.#batteryPaths.map(batteryPath => readBatteryWatts(batteryPath)));
+        const validReadings = readings.filter(watts => watts !== null);
+
+        if (validReadings.length === 0) {
+            this.#batteryPaths = []; // battery vanished; rediscover next tick
+            this.label.text = '--';
+            return;
+        }
+
+        const totalWatts = validReadings.reduce((sum, watts) => sum + watts, 0);
+        this.label.text = `${this.#formatter.format(totalWatts)} W`;
+    }
+}
+
 class NetStatSection extends StatSection {
     static {
         GObject.registerClass(this);
@@ -385,6 +602,19 @@ class Indicator extends PanelMenu.Button {
             Gio.SettingsBindFlags.GET);
         box.add_child(this._cpuSection);
 
+        this._temperatureSection = new TemperatureSection(iconDir);
+        this._settings.bind('show-temperature',
+            this._temperatureSection, 'visible',
+            Gio.SettingsBindFlags.GET);
+        box.add_child(this._temperatureSection);
+
+        // Visibility is managed by _syncPowerVisibility (setting AND on
+        // battery), so it isn't bound to the setting directly
+        this._powerSection = new PowerSection(iconDir);
+        this._powerSection.visible = false;
+        box.add_child(this._powerSection);
+        this._watchUPower();
+
         this._memSection = new MemSection(iconDir);
         this._settings.bind('show-memory',
             this._memSection, 'visible',
@@ -414,6 +644,10 @@ class Indicator extends PanelMenu.Button {
 
         this._cpuItem = this.menu.addAction(_('CPU'),
             () => this._toggleSettings('show-cpu'));
+        this._temperatureItem = this.menu.addAction(_('Temperature'),
+            () => this._toggleSettings('show-temperature'));
+        this._powerItem = this.menu.addAction(_('Power draw (on battery)'),
+            () => this._toggleSettings('show-power'));
         this._memItem = this.menu.addAction(_('Memory'),
             () => this._toggleSettings('show-memory'));
         this._swapItem = this.menu.addAction(_('Swap'),
@@ -438,6 +672,43 @@ class Indicator extends PanelMenu.Button {
         this._sync();
     }
 
+    _watchUPower() {
+        Gio.DBusProxy.new_for_bus(
+            Gio.BusType.SYSTEM,
+            Gio.DBusProxyFlags.DO_NOT_AUTO_START,
+            null,
+            'org.freedesktop.UPower',
+            '/org/freedesktop/UPower',
+            'org.freedesktop.UPower',
+            null,
+            (_source, result) => {
+                let upowerProxy;
+                try {
+                    upowerProxy = Gio.DBusProxy.new_for_bus_finish(result);
+                } catch (error) {
+                    logError(error, 'system-monitor-thermal UPower');
+                    return;
+                }
+                if (!this._settings)
+                    return; // indicator destroyed while connecting
+
+                this._upowerProxy = upowerProxy;
+                this._upowerProxy.connectObject('g-properties-changed',
+                    () => this._syncPowerVisibility(), this);
+                this._syncPowerVisibility();
+            });
+        this.connect('destroy', () => (this._upowerProxy = null));
+    }
+
+    _syncPowerVisibility() {
+        if (!this._powerSection || !this._settings)
+            return;
+        const onBattery = this._upowerProxy
+            ?.get_cached_property('OnBattery')?.unpack() ?? false;
+        this._powerSection.visible =
+            onBattery && this._settings.get_boolean('show-power');
+    }
+
     _updateSystemMonitorApp() {
         const appSystem = Shell.AppSystem.get_default();
         this._systemMonitorApp =
@@ -459,6 +730,13 @@ class Indicator extends PanelMenu.Button {
         this._cpuItem.setOrnament(this._settings.get_boolean('show-cpu')
             ? PopupMenu.Ornament.CHECK
             : PopupMenu.Ornament.NONE);
+        this._temperatureItem.setOrnament(this._settings.get_boolean('show-temperature')
+            ? PopupMenu.Ornament.CHECK
+            : PopupMenu.Ornament.NONE);
+        this._powerItem.setOrnament(this._settings.get_boolean('show-power')
+            ? PopupMenu.Ornament.CHECK
+            : PopupMenu.Ornament.NONE);
+        this._syncPowerVisibility();
         this._memItem.setOrnament(this._settings.get_boolean('show-memory')
             ? PopupMenu.Ornament.CHECK
             : PopupMenu.Ornament.NONE);

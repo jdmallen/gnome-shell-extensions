@@ -11,6 +11,14 @@ SPDX-License-Identifier: GPL-2.0-or-later
       <default>true</default>
       <summary>Show CPU usage</summary>
     </key>
+    <key name="show-temperature" type="b">
+      <default>true</default>
+      <summary>Show CPU temperature</summary>
+    </key>
+    <key name="show-power" type="b">
+      <default>true</default>
+      <summary>Show battery power draw (only while on battery)</summary>
+    </key>
     <key name="show-memory" type="b">
       <default>true</default>
       <summary>Show memory usage</summary>
